@@ -1,222 +1,168 @@
 """
-crypto/kdf.py
-─────────────
-Key Derivation Function layer.
+crypto/symmetric.py
+───────────────────
+AES-256-GCM bulk encryption for message payloads.
 
-After ML-KEM gives us a 32-byte shared secret, we must not use it
-directly as an encryption key.  We use HKDF (RFC 5869) with SHA3-256
-to stretch that single secret into separate keys for:
-  • Encryption  (AES-256-GCM key)
-  • MAC         (HMAC key, used if we ever need an additional MAC layer)
-  • IV seeding  (deterministic nonce generation)
+AES-256 with Grover's algorithm:
+  Grover's quantum search algorithm can search an N-item space in √N steps.
+  For AES-256, this reduces effective security from 256 bits to 128 bits.
+  128-bit post-quantum security is our target level (matching ML-KEM-768
+  category 3), so AES-256 is the correct choice here — not AES-128.
 
-Why SHA3 instead of SHA2 in HKDF?
-  SHA3 (Keccak) is a completely different construction from SHA2.
-  If an attack ever weakens SHA2, using SHA3 here ensures the KDF
-  layer remains independent.  Both are FIPS 202 / FIPS 180 approved.
+GCM mode provides:
+  • Confidentiality   — CTR-mode encryption hides plaintext
+  • Integrity         — GHASH authentication tag detects tampering
+  • Authenticity      — tag verification requires the correct key
 
-NIST SP 800-56C §4 and SP 800-108 §4 authorise HKDF for this purpose.
+Associated data (AAD):
+  We always authenticate the message header as AAD even though it is not
+  encrypted.  This ensures the sender's ID, recipient's ID, and sequence
+  number cannot be tampered with without invalidating the tag.
 """
 
 from __future__ import annotations
-import hashlib
-import hmac
-import struct
+
+from Crypto.Cipher import AES
+from dataclasses import dataclass
 
 import config
-from crypto.utils import secure_zero
+from crypto.utils import secure_zero, constant_time_compare
 
 
-# ─── Session key bundle ───────────────────────────────────────────────────────
+# ─── Data classes ─────────────────────────────────────────────────────────────
 
-class SessionKeys:
+@dataclass
+class EncryptedMessage:
     """
-    Derived symmetric keys for one session direction.
+    Output of encrypt_message().
 
-    Every session has two SessionKeys instances:
-      client_keys — used by the client when it is encrypting
-      server_keys — used by the server when it is encrypting
-
-    This prevents key reuse across directions even though both sides
-    derived their keys from the same shared secret.
-
-    Attributes:
-        enc_key  — 32-byte AES-256 encryption key
-        mac_key  — 32-byte HMAC key (supplemental authentication)
-        iv_seed  — 32-byte seed for deterministic nonce generation
+    ciphertext:  Encrypted payload bytes.
+    tag:         16-byte GCM authentication tag.
+    nonce:       12-byte nonce used for this message (derived from seq no.).
     """
-
-    def __init__(self, enc_key: bytearray, mac_key: bytearray, iv_seed: bytearray):
-        self._enc_key  = enc_key
-        self._mac_key  = mac_key
-        self._iv_seed  = iv_seed
-
-    @property
-    def enc_key(self) -> bytes:
-        return bytes(self._enc_key)
-
-    @property
-    def mac_key(self) -> bytes:
-        return bytes(self._mac_key)
-
-    @property
-    def iv_seed(self) -> bytes:
-        return bytes(self._iv_seed)
-
-    def destroy(self) -> None:
-        """
-        Zero all key material.  Call when a session ends or when rekeying.
-        FIPS 203 §3.3: destroy intermediate and session values when done.
-        """
-        secure_zero(self._enc_key)
-        secure_zero(self._mac_key)
-        secure_zero(self._iv_seed)
-
-    def derive_nonce(self, sequence_number: int) -> bytes:
-        """
-        Derive a deterministic 12-byte GCM nonce from the IV seed and
-        a sequence number.
-
-        Using a sequence-number-based nonce guarantees nonce uniqueness
-        without requiring extra randomness.  The sequence number is a
-        64-bit counter that never repeats within a session.
-
-        AES-GCM requires nonce uniqueness per key — this construction
-        satisfies that requirement as long as the sequence number never
-        wraps (which at one message per nanosecond would take ~584 years).
-        """
-        # HMAC-SHA3-256(iv_seed, sequence_number_as_8_bytes) → 32 bytes
-        # We take the first 12 bytes as the nonce.
-        seq_bytes = struct.pack(">Q", sequence_number)  # big-endian uint64
-        nonce_material = _hmac_sha3_256(self._iv_seed, seq_bytes)
-        return nonce_material[:config.GCM_NONCE_BYTES]  # first 12 bytes
+    ciphertext: bytes
+    tag: bytes        # 16 bytes
+    nonce: bytes      # 12 bytes
 
 
-# ─── HKDF implementation with SHA3-256 ───────────────────────────────────────
+# ─── Encryption ───────────────────────────────────────────────────────────────
 
-def derive_session_keys(
-    shared_secret: bytes,
-    handshake_transcript: bytes,
-    role: str,
-) -> SessionKeys:
+def encrypt_message(
+    key: bytes,
+    plaintext: bytes,
+    nonce: bytes,
+    associated_data: bytes = b"",
+) -> EncryptedMessage:
     """
-    Derive AES-256-GCM session keys from an ML-KEM shared secret.
-
-    Uses HKDF-Extract then HKDF-Expand (RFC 5869) with SHA3-256.
+    Encrypt and authenticate a message payload with AES-256-GCM.
 
     Args:
-        shared_secret:         32-byte output of ML-KEM decapsulate/encapsulate.
-        handshake_transcript:  SHA3-512 digest of all handshake messages.
-                               Binds the session keys to the specific handshake,
-                               so keys differ even if the same shared_secret
-                               appears in two different handshakes.
-        role:                  "client" or "server" — provides directional
-                               separation so each side uses different keys.
+        key:             32-byte AES-256 encryption key from SessionKeys.
+        plaintext:       The message body to encrypt.
+        nonce:           12-byte GCM nonce, must be unique per key.
+                         Obtain via SessionKeys.derive_nonce(seq_no).
+        associated_data: Plaintext data to authenticate but not encrypt
+                         (e.g., the message header bytes).
 
     Returns:
-        SessionKeys containing enc_key, mac_key, and iv_seed.
-    """
-    if role not in ("client", "server"):
-        raise ValueError("role must be 'client' or 'server'")
+        EncryptedMessage with ciphertext, tag (16 bytes), and nonce.
 
-    # ── Step 1: HKDF-Extract ─────────────────────────────────────────────────
-    # salt = handshake transcript (binds keys to this specific session)
-    # IKM  = ML-KEM shared secret
-    # PRK  = pseudorandom key material (32 bytes)
-    prk = _hkdf_extract(
-        salt=handshake_transcript[:32],  # first 32 bytes of SHA3-512 digest
-        ikm=shared_secret,
+    Raises:
+        ValueError if key or nonce sizes are incorrect.
+    """
+    _check_key(key)
+    _check_nonce(nonce)
+
+    cipher = AES.new(
+        key=key,
+        mode=AES.MODE_GCM,
+        nonce=nonce,
+        mac_len=config.GCM_TAG_BYTES,
     )
 
-    # ── Step 2: HKDF-Expand ──────────────────────────────────────────────────
-    # Expand PRK into three independent keys, each labelled by purpose and role.
-    # Including role in info ensures client and server get different keys even
-    # from the same PRK.
+    if associated_data:
+        cipher.update(associated_data)
 
-    role_bytes = role.encode()
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
 
-    enc_key = bytearray(_hkdf_expand(
-        prk=prk,
-        info=config.KDF_INFO_ENC + b"|" + role_bytes,
-        length=config.SYMMETRIC_KEY_BYTES,
-    ))
-    mac_key = bytearray(_hkdf_expand(
-        prk=prk,
-        info=config.KDF_INFO_MAC + b"|" + role_bytes,
-        length=config.SYMMETRIC_KEY_BYTES,
-    ))
-    iv_seed = bytearray(_hkdf_expand(
-        prk=prk,
-        info=config.KDF_INFO_IV + b"|" + role_bytes,
-        length=config.SYMMETRIC_KEY_BYTES,
-    ))
-
-    # ── Clean up intermediate PRK ─────────────────────────────────────────────
-    prk_buf = bytearray(prk)
-    secure_zero(prk_buf)
-
-    return SessionKeys(enc_key=enc_key, mac_key=mac_key, iv_seed=iv_seed)
+    return EncryptedMessage(
+        ciphertext=ciphertext,
+        tag=tag,
+        nonce=nonce,
+    )
 
 
-# ─── PBKDF2 for password-protected key storage ────────────────────────────────
+# ─── Decryption ───────────────────────────────────────────────────────────────
 
-def derive_storage_key(password: str, salt: bytes) -> bytearray:
+def decrypt_message(
+    key: bytes,
+    encrypted: EncryptedMessage,
+    associated_data: bytes = b"",
+) -> bytes:
     """
-    Derive a 32-byte key from a user password for encrypting stored keys.
+    Decrypt and verify an AES-256-GCM encrypted message.
 
-    Uses PBKDF2-HMAC-SHA256 with 600,000 iterations (NIST SP 800-132).
-    This is slow by design — it makes brute-force password attacks expensive.
+    The GCM tag is verified in constant time before any plaintext is
+    returned.  If verification fails, a ValueError is raised and no
+    plaintext is exposed to the caller.
 
     Args:
-        password:  User-supplied passphrase.
-        salt:      Random 32-byte salt (stored alongside the encrypted key).
+        key:             32-byte AES-256 key matching the one used to encrypt.
+        encrypted:       EncryptedMessage (ciphertext + tag + nonce).
+        associated_data: Must exactly match what was passed at encryption time.
 
     Returns:
-        32-byte key as bytearray for secure deletion.
+        Decrypted plaintext bytes.
+
+    Raises:
+        ValueError   if the authentication tag fails (tampered message).
+        ValueError   if key or nonce sizes are wrong.
     """
-    import hashlib
-    key = hashlib.pbkdf2_hmac(
-        hash_name=config.KEY_PBKDF2_HASH,
-        password=password.encode("utf-8"),
-        salt=salt,
-        iterations=config.KEY_PBKDF2_ITERATIONS,
-        dklen=config.SYMMETRIC_KEY_BYTES,
+    _check_key(key)
+    _check_nonce(encrypted.nonce)
+
+    if len(encrypted.tag) != config.GCM_TAG_BYTES:
+        raise ValueError(
+            f"GCM tag must be {config.GCM_TAG_BYTES} bytes, "
+            f"got {len(encrypted.tag)}"
+        )
+
+    cipher = AES.new(
+        key=key,
+        mode=AES.MODE_GCM,
+        nonce=encrypted.nonce,
+        mac_len=config.GCM_TAG_BYTES,
     )
-    return bytearray(key)
+
+    if associated_data:
+        cipher.update(associated_data)
+
+    try:
+        plaintext = cipher.decrypt_and_verify(encrypted.ciphertext, encrypted.tag)
+    except ValueError:
+        # PyCryptodome raises ValueError when the tag does not match.
+        # Re-raise with a cleaner message.
+        raise ValueError(
+            "Message authentication failed. "
+            "The message was tampered with, corrupted, or an incorrect key was used."
+        )
+
+    return plaintext
 
 
-# ─── HKDF primitives ─────────────────────────────────────────────────────────
+# ─── Input validation ─────────────────────────────────────────────────────────
 
-def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
-    """
-    HKDF-Extract (RFC 5869 §2.2).
-    Returns a 32-byte pseudorandom key (PRK).
-    """
-    # HMAC-SHA3-256(salt, IKM)
-    return _hmac_sha3_256(salt, ikm)
-
-
-def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
-    """
-    HKDF-Expand (RFC 5869 §2.3).
-    Expands PRK into `length` bytes of output keying material.
-    """
-    hash_len = 32  # SHA3-256 output size
-    n = -(-length // hash_len)  # ceiling division
-
-    okm = b""
-    t   = b""
-    for i in range(1, n + 1):
-        t = _hmac_sha3_256(prk, t + info + bytes([i]))
-        okm += t
-
-    return okm[:length]
+def _check_key(key: bytes) -> None:
+    if len(key) != config.SYMMETRIC_KEY_BYTES:
+        raise ValueError(
+            f"AES key must be {config.SYMMETRIC_KEY_BYTES} bytes (AES-256), "
+            f"got {len(key)}"
+        )
 
 
-def _hmac_sha3_256(key: bytes, data: bytes) -> bytes:
-    """HMAC with SHA3-256."""
-    return hmac.new(
-        key=bytes(key),
-        msg=data,
-        digestmod=hashlib.sha3_256,
-    ).digest()
+def _check_nonce(nonce: bytes) -> None:
+    if len(nonce) != config.GCM_NONCE_BYTES:
+        raise ValueError(
+            f"GCM nonce must be {config.GCM_NONCE_BYTES} bytes, "
+            f"got {len(nonce)}"
+        )
