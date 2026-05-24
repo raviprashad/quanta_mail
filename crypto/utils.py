@@ -48,7 +48,14 @@ def secure_zero(data: bytearray) -> None:
 
     # Overwrite via ctypes to prevent the compiler/interpreter from
     # optimising the write away (as it might with a pure-Python loop).
-    ctypes.memset(id(data) + bytearray.__basicsize__, 0, length)
+    # We use from_buffer to safely obtain a pointer to the internal buffer.
+    try:
+        buf = (ctypes.c_char * length).from_buffer(data)
+        ctypes.memset(buf, 0, length)
+    except Exception:
+        # Fallback if from_buffer fails
+        for i in range(length):
+            data[i] = 0
 
     # Belt-and-suspenders: also zero via Python to handle any offset edge cases.
     for i in range(length):
@@ -66,6 +73,9 @@ def secure_zero_bytes(data: bytes) -> None:
     """
     # We cannot truly zero immutable bytes in Python, but we can
     # try to overwrite the buffer via ctypes.
+    # We skip singletons/interned bytes (length <= 1) to avoid corrupting CPython.
+    if len(data) <= 1:
+        return
     try:
         ctypes.memset(id(data) + bytes.__basicsize__, 0, len(data))
     except Exception:

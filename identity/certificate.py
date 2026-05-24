@@ -94,7 +94,7 @@ class Certificate:
             "mlkem_encap_key":  self.mlkem_encap_key,
             "issuer_id":       self.issuer_id,
         }
-        return msgpack.packb(tbs, use_bin_True=True)
+        return msgpack.packb(tbs, use_bin_type=True)
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
@@ -110,7 +110,7 @@ class Certificate:
             "issuer_id":        self.issuer_id,
             "slhdsa_signature": self.slhdsa_signature,
         }
-        return msgpack.packb(data, use_bin_True=True)
+        return msgpack.packb(data, use_bin_type=True)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Certificate":

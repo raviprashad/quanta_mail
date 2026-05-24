@@ -69,7 +69,7 @@ class MessageHeader:
             "sequence_number": self.sequence_number,
             "timestamp":       self.timestamp,
             "message_type":    self.message_type,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "MessageHeader":
@@ -105,7 +105,7 @@ class EncryptedEnvelope:
             "tag":        self.tag,
             "nonce":      self.nonce,
             "signature":  self.signature,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "EncryptedEnvelope":
@@ -276,8 +276,11 @@ class Session:
         """
         self._assert_open()
 
-        envelope = EncryptedEnvelope.from_bytes(envelope_bytes)
-        header   = MessageHeader.from_bytes(envelope.header)
+        try:
+            envelope = EncryptedEnvelope.from_bytes(envelope_bytes)
+            header   = MessageHeader.from_bytes(envelope.header)
+        except Exception as e:
+            raise SessionError(f"Message deserialisation failed: {e}") from e
 
         # ── Header validation ─────────────────────────────────────────────────
         self._validate_header(header)
