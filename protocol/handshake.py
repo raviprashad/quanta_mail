@@ -89,7 +89,7 @@ class ClientHello:
             "kem_encap_key": self.kem_encap_key,
             "certificate":   self.certificate,
             "timestamp":     self.timestamp,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     def to_bytes(self) -> bytes:
         return msgpack.packb({
@@ -98,7 +98,7 @@ class ClientHello:
             "certificate":   self.certificate,
             "timestamp":     self.timestamp,
             "signature":     self.signature,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ClientHello":
@@ -132,7 +132,7 @@ class ServerHello:
             "transcript":     transcript_digest,
             "kem_ciphertext": self.kem_ciphertext,
             "certificate":    self.certificate,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     def to_bytes(self) -> bytes:
         return msgpack.packb({
@@ -140,7 +140,7 @@ class ServerHello:
             "kem_ciphertext": self.kem_ciphertext,
             "certificate":    self.certificate,
             "signature":      self.signature,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ServerHello":
@@ -170,7 +170,7 @@ class ClientFinished:
             "ct":    self.encrypted_confirmation,
             "tag":   self.tag,
             "nonce": self.nonce,
-        }, use_bin_True=True)
+        }, use_bin_type=True)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ClientFinished":

@@ -883,7 +883,7 @@ class TestSession:
         # Tamper with the header bytes
         header_dict = msgpack.unpackb(envelope.header, raw=False)
         header_dict["recipient_id"] = "eve"
-        envelope.header = msgpack.packb(header_dict, use_bin_True=True)
+        envelope.header = msgpack.packb(header_dict, use_bin_type=True)
 
         with pytest.raises(SessionError):
             server_session.decrypt(envelope.to_bytes())

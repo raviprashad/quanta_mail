@@ -154,9 +154,8 @@ def mldsa_sign(
     sig = oqs.Signature(config.DSA_ALGORITHM, secret_key=private_key)
 
     # liboqs ML-DSA.Sign handles hedged randomness internally.
-    # We pass message and context; liboqs builds M' = 0x00 || len(ctx) || ctx || M
-    # as specified in FIPS 204 Algorithm 2.
-    signature: bytes = sig.sign(message)
+    # We pass message and context using the context-aware sign method.
+    signature: bytes = sig.sign_with_ctx_str(message, context)
 
     _assert_size("mldsa_signature", signature, config.DSA_SIGNATURE_BYTES)
     return signature
@@ -194,7 +193,7 @@ def mldsa_verify(
 
     try:
         sig = oqs.Signature(config.DSA_ALGORITHM)
-        return sig.verify(message, signature, public_key)
+        return sig.verify_with_ctx_str(message, signature, context, public_key)
     except Exception:
         # Any exception from the library means invalid signature.
         return False

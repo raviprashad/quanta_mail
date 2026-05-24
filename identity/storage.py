@@ -227,7 +227,7 @@ def _pack_key_bundle(identity: UserIdentity) -> bytes:
         "mlkem_ek": identity.mlkem_encap_key,
         "mlkem_dk": identity.mlkem_decap_key,
     }
-    return msgpack.packb(bundle, use_bin_True=True)
+    return msgpack.packb(bundle, use_bin_type=True)
 
 
 def _unpack_key_bundle(
